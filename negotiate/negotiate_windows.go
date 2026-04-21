@@ -99,6 +99,13 @@ var (
 // Integrated Windows Authentication. SSPI resolves the actual Kerberos
 // service ticket using the logged-in user's credential automatically.
 func Token(hostname string) ([]byte, error) {
+	// Resolve any CNAME aliases to the canonical A-record hostname.
+	// SPNs are registered to in Active Directory under the canonical name;
+	// passing an alias would cause the KDC to reject the request.
+	if resolved, err := resolveCNAME(hostname); err == nil {
+		hostname = resolved
+	}
+
 	spn, err := syscall.UTF16PtrFromString("HTTP/" + hostname)
 	if err != nil {
 		return nil, fmt.Errorf("negotiate: encoding SPN: %w", err)
