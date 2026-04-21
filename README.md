@@ -62,6 +62,43 @@ If `klist` shows a valid TGT, the request authenticates automatically.
 
 ---
 
+## Options styles
+
+There are three equivalent ways to configure a client.
+
+### Inline options (original style)
+
+```go
+c, err := krbhttp.NewClient(
+    krbhttp.WithCA("/etc/ssl/certs/corporate-ca.pem"),
+    krbhttp.WithCookieFile("~/.config/myapp/session.cookie"),
+)
+```
+
+### Pre-configured Options struct
+
+Build an `*Options` value ahead of time, then call `NewClient` on it when ready.
+Useful when configuration is spread across multiple functions or conditionally assembled.
+
+```go
+opts := krbhttp.NewOptions()
+opts.WithCA("/etc/ssl/certs/corporate-ca.pem")
+opts.WithCookieFile("~/.config/myapp/session.cookie")
+
+c, err := opts.NewClient()
+```
+
+### Chained builder
+
+```go
+c, err := krbhttp.NewOptions().
+    WithCA("/etc/ssl/certs/corporate-ca.pem").
+    WithCookieFile("~/.config/myapp/session.cookie").
+    NewClient()
+```
+
+---
+
 ## Platform support
 
 All three platforms are CGo-free:
@@ -103,6 +140,9 @@ Cookies survive for the lifetime of the `*http.Client`. Good for short-lived pro
 
 ```go
 c, err := krbhttp.NewClient()
+
+// or
+c, err := krbhttp.NewOptions().NewClient()
 ```
 
 ### File-backed
@@ -113,6 +153,11 @@ Cookies are loaded from a Netscape/curl-format file at startup and written back 
 c, err := krbhttp.NewClient(
     krbhttp.WithCookieFile("/home/alice/.config/myapp/session.cookie"),
 )
+
+// or
+opts := krbhttp.NewOptions()
+opts.WithCookieFile("/home/alice/.config/myapp/session.cookie")
+c, err := opts.NewClient()
 ```
 
 ### Bring-your-own jar
@@ -144,7 +189,10 @@ c, err := krbhttp.NewClient(
 
 ## All options
 
+All options are available through both the `NewClient` functional style and the `*Options` builder style.
+
 ```go
+// Functional style — pass options directly to NewClient
 c, err := krbhttp.NewClient(
     // TLS
     krbhttp.WithCA("/etc/ssl/certs/corporate-ca.pem"),    // add a custom CA bundle
@@ -162,10 +210,26 @@ c, err := krbhttp.NewClient(
 
     // Observability
     krbhttp.WithTokenErrorHandler(func(err error) {
-        log.Printf("SPNEGO token error: %v", err) // called when Kerberos auth is skipped
+        log.Printf("SPNEGO token error: %v", err)
     }),
-    krbhttp.WithVerboseReq(krbhttp.DefaultVerboseReq),   // curl-style "> METHOD /path HTTP/1.1" to stderr
-    krbhttp.WithVerboseResp(krbhttp.DefaultVerboseResp), // curl-style "< HTTP/1.1 200 OK" to stderr)
+    krbhttp.WithVerboseReq(krbhttp.DefaultVerboseReq),
+    krbhttp.WithVerboseResp(krbhttp.DefaultVerboseResp),
+)
+
+// Options struct style — configure ahead of time, build later
+opts := krbhttp.NewOptions()
+opts.WithCA("/etc/ssl/certs/corporate-ca.pem")
+opts.WithClientCert("client.crt", "client.key")
+opts.WithInsecure(true)
+opts.WithCookieFile("~/.config/myapp/session.cookie")
+opts.WithCCachePath("/tmp/krb5cc_1000")
+opts.WithConfPath("/etc/krb5.conf")
+opts.WithTokenErrorHandler(func(err error) {
+    log.Printf("SPNEGO token error: %v", err)
+})
+opts.WithVerboseReq(krbhttp.DefaultVerboseReq)
+opts.WithVerboseResp(krbhttp.DefaultVerboseResp)
+c, err := opts.NewClient()
 ```
 
 `DefaultVerboseReq` and `DefaultVerboseResp` print curl `--verbose`-style output to stderr. For example, an authenticated redirect flow looks like:
@@ -226,7 +290,7 @@ c := &http.Client{
 
 ## Example
 
-The [example/](example/) directory contains a runnable program with full verbose tracing. Point it at any SPNEGO-protected endpoint:
+The [example/](example/) directory contains a runnable program with simple verbose tracing. Point it at any SPNEGO-protected endpoint:
 
 ```bash
 export TARGET_URL=https://internal-api.corp.example.com/api/user
