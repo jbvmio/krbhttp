@@ -25,18 +25,19 @@ type Option func(*Options)
 //	// or chained:
 //	c, err := krbhttp.NewOptions().WithCA(caPath).WithInsecure(true).NewClient()
 type Options struct {
-	caPath          string
-	certPath        string
-	keyPath         string
-	insecure        bool
-	ccachePath      string
-	confPath        string
-	cookieFile      string
-	customJar       http.CookieJar
-	hasCustomJar    bool // distinguishes WithCookieJar(nil) from unset
-	tokenErrFunc    func(error)
-	verboseReqFunc  func(*http.Request)
-	verboseRespFunc func(*http.Response)
+	caPath           string
+	certPath         string
+	keyPath          string
+	insecure         bool
+	ccachePath       string
+	confPath         string
+	cookieFile       string
+	customJar        http.CookieJar
+	hasCustomJar     bool // distinguishes WithCookieJar(nil) from unset
+	tokenErrFunc     func(error)
+	verboseReqFunc   func(*http.Request)
+	verboseRespFunc  func(*http.Response)
+	verboseTokenFunc func(string)
 }
 
 // NewOptions returns a new zero-value Options ready for configuration.
@@ -102,6 +103,15 @@ func (o *Options) WithVerboseReq(fn func(*http.Request)) *Options {
 
 func (o *Options) WithVerboseResp(fn func(*http.Response)) *Options {
 	o.verboseRespFunc = fn
+	return o
+}
+
+// WithVerboseToken sets a callback that receives informational SPNEGO messages
+// such as GSS_S_BAD_MECH. These are benign and only surfaced in verbose mode.
+// When any verbose req/resp logging is active and this option is not set,
+// DefaultVerboseToken is used automatically.
+func (o *Options) WithVerboseToken(fn func(string)) *Options {
+	o.verboseTokenFunc = fn
 	return o
 }
 
@@ -174,6 +184,24 @@ func WithVerboseReq(fn func(*http.Request)) Option {
 
 func WithVerboseResp(fn func(*http.Response)) Option {
 	return func(o *Options) { o.verboseRespFunc = fn }
+}
+
+// WithVerboseToken sets a callback that receives informational SPNEGO messages
+// such as GSS_S_BAD_MECH. These are benign and only surfaced in verbose mode.
+// When any verbose req/resp logging is active and this option is not set,
+// DefaultVerboseToken is used automatically.
+func WithVerboseToken(fn func(string)) Option {
+	return func(o *Options) { o.verboseTokenFunc = fn }
+}
+
+// DefaultVerboseToken writes SPNEGO informational messages to os.Stderr using
+// curl's "* " prefix, matching the output curl --verbose prints for benign
+// GSSAPI failures such as GSS_S_BAD_MECH.
+//
+// It is wired automatically when request/response verbose logging is active
+// and no WithVerboseToken option is set.
+func DefaultVerboseToken(msg string) {
+	fmt.Fprintf(os.Stderr, "* %s\n", msg)
 }
 
 // DefaultVerboseReq writes curl-style request tracing to os.Stderr.
@@ -258,6 +286,13 @@ func buildClient(o *Options) (*http.Client, error) {
 		return nil, fmt.Errorf("client: building TLS transport: %w", err)
 	}
 	spnegoTr := &spnego.Transport{Base: baseTr, TokenErrFunc: o.tokenErrFunc}
+	// Wire the verbose token func: use the caller-supplied one, or fall back to
+	// DefaultVerboseToken when any verbose req/resp logging is active.
+	verboseTokenFn := o.verboseTokenFunc
+	if verboseTokenFn == nil && (o.verboseReqFunc != nil || o.verboseRespFunc != nil) {
+		verboseTokenFn = DefaultVerboseToken
+	}
+	spnegoTr.VerboseFunc = verboseTokenFn
 	var finalTr http.RoundTripper = spnegoTr
 	if o.verboseReqFunc != nil || o.verboseRespFunc != nil {
 		finalTr = &verboseTransport{

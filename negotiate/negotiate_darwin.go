@@ -157,7 +157,15 @@ func Token(hostname string) ([]byte, error) {
 	}
 
 	if major != gssComplete && major != gssContinue {
-		return nil, fmt.Errorf("negotiate: gss_init_sec_context failed: major=0x%08x minor=0x%08x", major, minor)
+		// Decode the routine error field (bits 23–16). A value of 1 is
+		// GSS_S_BAD_MECH: the SPN has no registered ticket for this host.
+		// This is benign noise when a session cookie covers the request —
+		// curl buries the same message in --verbose output only.
+		routineErr := (major >> 16) & 0xFF
+		return nil, &NegotiateError{
+			msg:             fmt.Sprintf("negotiate: gss_init_sec_context failed: major=0x%08x minor=0x%08x", major, minor),
+			unsupportedMech: routineErr == 1,
+		}
 	}
 
 	// --- Step 3: Copy the token bytes from C memory, then release the buffer. ---

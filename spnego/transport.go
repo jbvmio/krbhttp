@@ -2,6 +2,7 @@ package spnego
 
 import (
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -41,13 +42,21 @@ import (
 //
 // Base defaults to http.DefaultTransport if nil.
 //
-// TokenErrFunc, if non-nil, is called whenever negotiate.Token fails. The
-// request is still forwarded without an Authorization header (fail-open), but
-// the callback gives callers visibility into why authentication was skipped.
+// TokenErrFunc, if non-nil, is called for actionable token failures such as
+// an expired TGT or missing credentials. The request is still forwarded
+// without an Authorization header (fail-open).
 // Set via client.WithTokenErrorHandler.
+//
+// VerboseFunc, if non-nil, receives informational SPNEGO messages that are
+// benign — specifically GSS_S_BAD_MECH, where the host's SPN is not
+// registered and the session cookie covers the request. These mirror the
+// messages curl prints in --verbose mode with a leading "* ".
+// Set via client.WithVerboseToken; auto-wired to client.DefaultVerboseToken
+// whenever request/response verbose logging is active.
 type Transport struct {
 	Base         http.RoundTripper
 	TokenErrFunc func(error)
+	VerboseFunc  func(string)
 }
 
 func (t *Transport) base() http.RoundTripper {
@@ -66,8 +75,17 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	host := extractHost(req.URL.Host)
 	tokenBytes, err := negotiate.Token(host)
-	if err != nil && t.TokenErrFunc != nil {
-		t.TokenErrFunc(err)
+	if err != nil {
+		var ne *negotiate.NegotiateError
+		if errors.As(err, &ne) && ne.IsUnsupportedMech() {
+			// Benign: SPN not registered for this host; session cookie covers it.
+			// Route to VerboseFunc only — same behaviour as curl --verbose.
+			if t.VerboseFunc != nil {
+				t.VerboseFunc(err.Error())
+			}
+		} else if t.TokenErrFunc != nil {
+			t.TokenErrFunc(err)
+		}
 	}
 
 	// Clone once for all header mutations. We always need a clone because
