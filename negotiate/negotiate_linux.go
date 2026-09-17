@@ -26,6 +26,7 @@ package negotiate
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -33,6 +34,8 @@ import (
 	krbclient "github.com/jcmturner/gokrb5/v8/client"
 	"github.com/jcmturner/gokrb5/v8/config"
 	"github.com/jcmturner/gokrb5/v8/credentials"
+	"github.com/jcmturner/gokrb5/v8/iana/errorcode"
+	"github.com/jcmturner/gokrb5/v8/messages"
 	"github.com/jcmturner/gokrb5/v8/spnego"
 
 	"github.com/jbvmio/krbhttp/krb"
@@ -63,22 +66,15 @@ func SetConfPath(path string) {
 	mu.Unlock()
 }
 
-// Token generates a raw SPNEGO/Kerberos token for use in an HTTP Negotiate
-// authentication header targeting the given hostname.
+// tokenForHost generates a raw SPNEGO/Kerberos token for the SPN HTTP/hostname
+// built from hostname verbatim (no DNS canonicalization).
 //
 // The SPN is constructed as "HTTP/hostname" and passed explicitly to gokrb5,
 // bypassing the broken net.LookupCNAME path entirely.
 //
 // The ccache and krb5.conf paths are resolved at call time so that calls to
 // SetCCachePath / SetConfPath take effect without restarting.
-func Token(hostname string) ([]byte, error) {
-	// Resolve any CNAME aliases to the canonical A-record hostname.
-	// SPNs are registered in Active Directory under the canonical name;
-	// passing an alias would cause the KDC to reject the request.
-	if resolved, err := resolveCNAME(hostname); err == nil {
-		hostname = resolved
-	}
-
+func tokenForHost(hostname string) ([]byte, error) {
 	mu.RLock()
 	cc := ccachePath
 	cf := confPath
@@ -124,12 +120,12 @@ func Token(hostname string) ([]byte, error) {
 	s := spnego.SPNEGOClient(cl, spn)
 
 	if err := s.AcquireCred(); err != nil {
-		return nil, fmt.Errorf("negotiate: acquiring SPNEGO credential for %s: %w", spn, err)
+		return nil, classifyKRBError(fmt.Errorf("negotiate: acquiring SPNEGO credential for %s: %w", spn, err))
 	}
 
 	st, err := s.InitSecContext()
 	if err != nil {
-		return nil, fmt.Errorf("negotiate: initialising security context for %s: %w", spn, err)
+		return nil, classifyKRBError(fmt.Errorf("negotiate: initialising security context for %s: %w", spn, err))
 	}
 
 	// Marshal the NegTokenInit to bytes.
@@ -153,4 +149,15 @@ func Token(hostname string) ([]byte, error) {
 	}
 
 	return tokenBytes, nil
+}
+
+// classifyKRBError flags KDC_ERR_S_PRINCIPAL_UNKNOWN (the gokrb5 equivalent of
+// GSS_S_BAD_MECH) as unsupportedMech so Token can fall back to the canonical
+// hostname. All other errors are returned unchanged.
+func classifyKRBError(err error) error {
+	var krbErr messages.KRBError
+	if errors.As(err, &krbErr) && krbErr.ErrorCode == errorcode.KDC_ERR_S_PRINCIPAL_UNKNOWN {
+		return &NegotiateError{msg: err.Error(), unsupportedMech: true}
+	}
+	return err
 }

@@ -123,10 +123,18 @@ The transport adds a fresh, host-specific Kerberos token to _every_ outgoing req
 
 This mirrors the behavior of `curl --negotiate --location-trusted`.
 
-### CNAME resolution
+### SPN canonicalization (literal-first with fallback)
 
-SPNs in Active Directory are registered under canonical A-record hostnames, not CNAME aliases. Passing an alias gets a `KDC_ERR_S_PRINCIPAL_UNKNOWN` rejection. Before constructing any SPN, `krbhttp` iterates `net.LookupCNAME` until the result stabilises — a single call is not sufficient because both the CGo and pure-Go resolvers can stop at intermediate hops for multi-level CNAME chains.
-https://github.com/golang/go/issues/59943
+The Kerberos SPN a client presents is `HTTP/<host>`. Which `<host>` is correct depends on the environment, and the two common topologies pull in opposite directions:
+
+- **Canonical-A-record registered** (single host behind a CNAME alias): the SPN is registered under the final A-record, so the alias must be **resolved**. Passing the alias verbatim gets `KDC_ERR_S_PRINCIPAL_UNKNOWN` / `GSS_S_BAD_MECH`. This is the [gokrb5 #527](https://github.com/jcmturner/gokrb5/issues/527) case.
+- **Alias registered** (service alias in front of a load balancer / GSLB VIP): the SPN is registered under the **alias**, and resolving collapses it to a shared VIP that has no SPN — again a rejection.
+
+No single unconditional strategy satisfies both. `krbhttp` therefore uses **literal-first with fallback**, mirroring MIT krb5's `dns_canonicalize_hostname = fallback` (and how curl behaves): it builds the SPN from the URL host verbatim first, and only if the KDC/mechanism rejects it as an unknown SPN does it retry with the CNAME-resolved canonical name. When resolution is needed, `krbhttp` iterates `net.LookupCNAME` until the result stabilises — a single call is not sufficient because both the CGo and pure-Go resolvers can stop at intermediate hops for multi-level CNAME chains ([golang/go#59943](https://github.com/golang/go/issues/59943)).
+
+In practice, Windows/SSPI and macOS/`GSS.framework` usually resolve or accept the literal SPN themselves, so the application-level fallback rarely fires there; it does the real work on Linux, where gokrb5 has no internal canonicalization or fallback of its own.
+
+Override the strategy per client with [`WithSPNCanonicalization`](#all-options): `CanonicalizeFallback` (default), `CanonicalizeNever` (literal only), or `CanonicalizeAlways` (resolve first, legacy behaviour).
 
 ---
 
@@ -214,6 +222,9 @@ c, err := krbhttp.NewClient(
     }),
     krbhttp.WithVerboseReq(krbhttp.DefaultVerboseReq),
     krbhttp.WithVerboseResp(krbhttp.DefaultVerboseResp),
+
+    // SPN canonicalization (default: CanonicalizeFallback — literal-first)
+    krbhttp.WithSPNCanonicalization(krbhttp.CanonicalizeFallback),
 )
 
 // Options struct style — configure ahead of time, build later
@@ -229,6 +240,7 @@ opts.WithTokenErrorHandler(func(err error) {
 })
 opts.WithVerboseReq(krbhttp.DefaultVerboseReq)
 opts.WithVerboseResp(krbhttp.DefaultVerboseResp)
+opts.WithSPNCanonicalization(krbhttp.CanonicalizeFallback)
 c, err := opts.NewClient()
 ```
 

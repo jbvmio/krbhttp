@@ -88,8 +88,8 @@ func init() {
 	purego.RegisterLibFunc(&gssDeleteSecContext, lib, "gss_delete_sec_context")
 }
 
-// Token generates a raw SPNEGO/Kerberos token for use in an HTTP Negotiate
-// authentication header targeting the given hostname. The returned bytes are
+// tokenForHost generates a raw SPNEGO/Kerberos token for the SPN HTTP/hostname
+// built from hostname verbatim (no DNS canonicalization). The returned bytes are
 // the decoded token (not base64 encoded) — callers are responsible for encoding.
 //
 // The hostname should be the bare hostname (no scheme, no port, no path), e.g.
@@ -99,14 +99,7 @@ func init() {
 //
 // Credentials are sourced automatically from the macOS Kerberos credential
 // store (both API-type/CCAPI and FILE-type ccaches are consulted).
-func Token(hostname string) ([]byte, error) {
-	// Resolve any CNAME aliases to the canonical A-record hostname.
-	// SPNs are registered in Active Directory under the canonical name, not
-	// aliases, so gss_import_name must receive the real hostname.
-	if resolved, err := resolveCNAME(hostname); err == nil {
-		hostname = resolved
-	}
-
+func tokenForHost(hostname string) ([]byte, error) {
 	// --- Step 1: Import the target service name. ---
 	// Format: "HTTP@hostname" with GSS_C_NT_HOSTBASED_SERVICE.
 	// The framework maps "service@host" → "service/host" SPN for the KDC.
@@ -158,9 +151,9 @@ func Token(hostname string) ([]byte, error) {
 
 	if major != gssComplete && major != gssContinue {
 		// Decode the routine error field (bits 23–16). A value of 1 is
-		// GSS_S_BAD_MECH: the SPN has no registered ticket for this host.
-		// This is benign noise when a session cookie covers the request —
-		// curl buries the same message in --verbose output only.
+		// GSS_S_BAD_MECH: the literal SPN has no registered ticket for this
+		// host. Flagged as unsupportedMech so Token can fall back to the
+		// CNAME-resolved canonical name.
 		routineErr := (major >> 16) & 0xFF
 		return nil, &NegotiateError{
 			msg:             fmt.Sprintf("negotiate: gss_init_sec_context failed: major=0x%08x minor=0x%08x", major, minor),

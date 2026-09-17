@@ -7,10 +7,25 @@ import (
 	"os"
 	"sort"
 
+	"github.com/jbvmio/krbhttp/negotiate"
 	"github.com/jbvmio/krbhttp/spnego"
 )
 
 type Option func(*Options)
+
+// Canonicalization selects how the Kerberos SPN host is derived. See
+// WithSPNCanonicalization.
+type Canonicalization = negotiate.Canonicalization
+
+const (
+	// CanonicalizeFallback tries the URL host verbatim and only resolves the
+	// CNAME chain if the KDC/mechanism rejects it. This is the default.
+	CanonicalizeFallback = negotiate.CanonicalizeFallback
+	// CanonicalizeNever always uses the URL host verbatim and never resolves.
+	CanonicalizeNever = negotiate.CanonicalizeNever
+	// CanonicalizeAlways resolves the CNAME chain first (legacy behaviour).
+	CanonicalizeAlways = negotiate.CanonicalizeAlways
+)
 
 // Options holds the configuration for a krbhttp client.
 // Use NewOptions to create an instance, configure it with builder methods,
@@ -38,6 +53,7 @@ type Options struct {
 	verboseReqFunc   func(*http.Request)
 	verboseRespFunc  func(*http.Response)
 	verboseTokenFunc func(string)
+	canon            Canonicalization
 }
 
 // NewOptions returns a new zero-value Options ready for configuration.
@@ -106,12 +122,22 @@ func (o *Options) WithVerboseResp(fn func(*http.Response)) *Options {
 	return o
 }
 
-// WithVerboseToken sets a callback that receives informational SPNEGO messages
-// such as GSS_S_BAD_MECH. These are benign and only surfaced in verbose mode.
-// When any verbose req/resp logging is active and this option is not set,
-// DefaultVerboseToken is used automatically.
+// WithVerboseToken sets a callback that receives informational SPNEGO messages,
+// such as the notice emitted when a literal SPN is rejected and the canonical
+// fallback is attempted. When any verbose req/resp logging is active and this
+// option is not set, DefaultVerboseToken is used automatically.
 func (o *Options) WithVerboseToken(fn func(string)) *Options {
 	o.verboseTokenFunc = fn
+	return o
+}
+
+// WithSPNCanonicalization sets how the Kerberos SPN host is derived. The
+// default (CanonicalizeFallback) tries the URL host verbatim and only resolves
+// the CNAME chain if the KDC/mechanism rejects it, matching MIT krb5's
+// dns_canonicalize_hostname=fallback. Use CanonicalizeNever to always pass the
+// URL host as-is, or CanonicalizeAlways for the legacy resolve-first behaviour.
+func (o *Options) WithSPNCanonicalization(mode Canonicalization) *Options {
+	o.canon = mode
 	return o
 }
 
@@ -186,17 +212,25 @@ func WithVerboseResp(fn func(*http.Response)) Option {
 	return func(o *Options) { o.verboseRespFunc = fn }
 }
 
-// WithVerboseToken sets a callback that receives informational SPNEGO messages
-// such as GSS_S_BAD_MECH. These are benign and only surfaced in verbose mode.
-// When any verbose req/resp logging is active and this option is not set,
-// DefaultVerboseToken is used automatically.
+// WithVerboseToken sets a callback that receives informational SPNEGO messages,
+// such as the notice emitted when a literal SPN is rejected and the canonical
+// fallback is attempted. When any verbose req/resp logging is active and this
+// option is not set, DefaultVerboseToken is used automatically.
 func WithVerboseToken(fn func(string)) Option {
 	return func(o *Options) { o.verboseTokenFunc = fn }
 }
 
+// WithSPNCanonicalization sets how the Kerberos SPN host is derived. The
+// default (CanonicalizeFallback) tries the URL host verbatim and only resolves
+// the CNAME chain if the KDC/mechanism rejects it, matching MIT krb5's
+// dns_canonicalize_hostname=fallback. Use CanonicalizeNever to always pass the
+// URL host as-is, or CanonicalizeAlways for the legacy resolve-first behaviour.
+func WithSPNCanonicalization(mode Canonicalization) Option {
+	return func(o *Options) { o.canon = mode }
+}
+
 // DefaultVerboseToken writes SPNEGO informational messages to os.Stderr using
-// curl's "* " prefix, matching the output curl --verbose prints for benign
-// GSSAPI failures such as GSS_S_BAD_MECH.
+// curl's "* " prefix, matching curl --verbose output.
 //
 // It is wired automatically when request/response verbose logging is active
 // and no WithVerboseToken option is set.
@@ -285,7 +319,7 @@ func buildClient(o *Options) (*http.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("client: building TLS transport: %w", err)
 	}
-	spnegoTr := &spnego.Transport{Base: baseTr, TokenErrFunc: o.tokenErrFunc}
+	spnegoTr := &spnego.Transport{Base: baseTr, TokenErrFunc: o.tokenErrFunc, Canon: o.canon}
 	// Wire the verbose token func: use the caller-supplied one, or fall back to
 	// DefaultVerboseToken when any verbose req/resp logging is active.
 	verboseTokenFn := o.verboseTokenFunc

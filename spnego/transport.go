@@ -2,7 +2,6 @@ package spnego
 
 import (
 	"encoding/base64"
-	"errors"
 	"net/http"
 	"strings"
 
@@ -42,21 +41,24 @@ import (
 //
 // Base defaults to http.DefaultTransport if nil.
 //
-// TokenErrFunc, if non-nil, is called for actionable token failures such as
-// an expired TGT or missing credentials. The request is still forwarded
-// without an Authorization header (fail-open).
+// TokenErrFunc, if non-nil, is called when SPNEGO token generation fails after
+// both the literal and canonical-fallback attempts. The request is still
+// forwarded without an Authorization header (fail-open).
 // Set via client.WithTokenErrorHandler.
 //
-// VerboseFunc, if non-nil, receives informational SPNEGO messages that are
-// benign — specifically GSS_S_BAD_MECH, where the host's SPN is not
-// registered and the session cookie covers the request. These mirror the
-// messages curl prints in --verbose mode with a leading "* ".
-// Set via client.WithVerboseToken; auto-wired to client.DefaultVerboseToken
-// whenever request/response verbose logging is active.
+// VerboseFunc, if non-nil, receives informational SPNEGO messages — currently
+// the notice emitted when the literal SPN is rejected and the canonical
+// fallback is attempted. These mirror the messages curl prints in --verbose
+// mode with a leading "* ". Set via client.WithVerboseToken; auto-wired to
+// client.DefaultVerboseToken whenever request/response verbose logging is active.
+//
+// Canon selects how the SPN host is derived; the zero value is
+// negotiate.CanonicalizeFallback (literal-first with fallback).
 type Transport struct {
 	Base         http.RoundTripper
 	TokenErrFunc func(error)
 	VerboseFunc  func(string)
+	Canon        negotiate.Canonicalization
 }
 
 func (t *Transport) base() http.RoundTripper {
@@ -74,18 +76,10 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	host := extractHost(req.URL.Host)
-	tokenBytes, err := negotiate.Token(host)
-	if err != nil {
-		var ne *negotiate.NegotiateError
-		if errors.As(err, &ne) && ne.IsUnsupportedMech() {
-			// Benign: SPN not registered for this host; session cookie covers it.
-			// Route to VerboseFunc only — same behaviour as curl --verbose.
-			if t.VerboseFunc != nil {
-				t.VerboseFunc(err.Error())
-			}
-		} else if t.TokenErrFunc != nil {
-			t.TokenErrFunc(err)
-		}
+	tokenBytes, err := negotiate.Token(host, t.Canon, t.VerboseFunc)
+	if err != nil && t.TokenErrFunc != nil {
+		// Both the literal and canonical-fallback attempts failed; surface it.
+		t.TokenErrFunc(err)
 	}
 
 	// Clone once for all header mutations. We always need a clone because

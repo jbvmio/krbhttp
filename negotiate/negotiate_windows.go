@@ -41,6 +41,8 @@ const (
 
 	secEOk             = uint32(0x00000000) // SEC_E_OK
 	secIContinueNeeded = uint32(0x00090312) // SEC_I_CONTINUE_NEEDED
+	secETargetUnknown  = uint32(0x80090303) // SEC_E_TARGET_UNKNOWN (SPN not found)
+	secEWrongPrincipal = uint32(0x80090322) // SEC_E_WRONG_PRINCIPAL
 	maxTokenSize       = 65536              // generous upper bound for the output buffer
 
 	secpkgNegotiate = "Negotiate" // SSPI security package name for SPNEGO
@@ -92,20 +94,13 @@ var (
 	procFreeContextBuffer          = modSecur32.NewProc("FreeContextBuffer")
 )
 
-// Token generates a raw SPNEGO token for use in an HTTP Negotiate
-// authentication header targeting the given hostname.
+// tokenForHost generates a raw SPNEGO token for the SPN HTTP/hostname built
+// from hostname verbatim (no DNS canonicalization).
 //
 // The SPN is "HTTP/hostname" — the standard SPNEGO SPN format for HTTP
 // Integrated Windows Authentication. SSPI resolves the actual Kerberos
 // service ticket using the logged-in user's credential automatically.
-func Token(hostname string) ([]byte, error) {
-	// Resolve any CNAME aliases to the canonical A-record hostname.
-	// SPNs are registered to in Active Directory under the canonical name;
-	// passing an alias would cause the KDC to reject the request.
-	if resolved, err := resolveCNAME(hostname); err == nil {
-		hostname = resolved
-	}
-
+func tokenForHost(hostname string) ([]byte, error) {
 	spn, err := syscall.UTF16PtrFromString("HTTP/" + hostname)
 	if err != nil {
 		return nil, fmt.Errorf("negotiate: encoding SPN: %w", err)
@@ -169,6 +164,15 @@ func Token(hostname string) ([]byte, error) {
 	defer procDeleteSecurityContext.Call(uintptr(unsafe.Pointer(&ctx)))
 
 	if r != uintptr(secEOk) && r != uintptr(secIContinueNeeded) {
+		// SEC_E_TARGET_UNKNOWN / SEC_E_WRONG_PRINCIPAL are the SSPI equivalents
+		// of GSS_S_BAD_MECH; flag them so Token can fall back to the canonical
+		// hostname.
+		if uint32(r) == secETargetUnknown || uint32(r) == secEWrongPrincipal {
+			return nil, &NegotiateError{
+				msg:             fmt.Sprintf("negotiate: InitializeSecurityContextW: 0x%08x", r),
+				unsupportedMech: true,
+			}
+		}
 		return nil, fmt.Errorf("negotiate: InitializeSecurityContextW: 0x%08x", r)
 	}
 
