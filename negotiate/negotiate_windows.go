@@ -45,7 +45,8 @@ const (
 	secEWrongPrincipal = uint32(0x80090322) // SEC_E_WRONG_PRINCIPAL
 	maxTokenSize       = 65536              // generous upper bound for the output buffer
 
-	secpkgNegotiate = "Negotiate" // SSPI security package name for SPNEGO
+	secpkgNegotiate = "Negotiate" // SPNEGO (retained for reference)
+	secpkgKerberos  = "Kerberos"  // raw Kerberos SSP — avoids silent NTLM downgrade
 )
 
 // Windows SSPI structures (from sspi.h).
@@ -94,18 +95,37 @@ var (
 	procFreeContextBuffer          = modSecur32.NewProc("FreeContextBuffer")
 )
 
-// tokenForHost generates a raw SPNEGO token for the SPN HTTP/hostname built
-// from hostname verbatim (no DNS canonicalization).
-//
-// The SPN is "HTTP/hostname" — the standard SPNEGO SPN format for HTTP
-// Integrated Windows Authentication. SSPI resolves the actual Kerberos
-// service ticket using the logged-in user's credential automatically.
+// tokenForHost generates a Kerberos token for the SPN HTTP/hostname using the
+// "Kerberos" SSP. The "Negotiate" package silently downgrades to NTLM when the
+// Kerberos SPN is unknown (returning SEC_E_OK + an NTLMSSP blob), which hides
+// the unknown-SPN signal and leaks NTLM to OIDC endpoints; the "Kerberos"
+// package surfaces SEC_E_TARGET_UNKNOWN instead so Token can fall back.
 func tokenForHost(hostname string) ([]byte, error) {
+	tok, err := sspiToken(hostname, secpkgKerberos)
+	if err != nil {
+		return nil, err
+	}
+	if isNTLMToken(tok) {
+		return nil, &NegotiateError{
+			msg:             fmt.Sprintf("negotiate: got NTLM token for HTTP/%s (no Kerberos SPN)", hostname),
+			unsupportedMech: true,
+		}
+	}
+	return tok, nil
+}
+
+// Backend reports the active token backend for diagnostics.
+func Backend() string { return "sspi (" + secpkgKerberos + ")" }
+
+// sspiToken generates a raw token for the SPN HTTP/hostname using the named
+// SSPI security package. SSPI resolves the Kerberos service ticket using the
+// logged-in user's credential automatically.
+func sspiToken(hostname, pkgName string) ([]byte, error) {
 	spn, err := syscall.UTF16PtrFromString("HTTP/" + hostname)
 	if err != nil {
 		return nil, fmt.Errorf("negotiate: encoding SPN: %w", err)
 	}
-	pkg, err := syscall.UTF16PtrFromString(secpkgNegotiate)
+	pkg, err := syscall.UTF16PtrFromString(pkgName)
 	if err != nil {
 		return nil, fmt.Errorf("negotiate: encoding package name: %w", err)
 	}

@@ -27,6 +27,11 @@ const (
 	CanonicalizeAlways = negotiate.CanonicalizeAlways
 )
 
+// Backend reports which SPNEGO token backend is active on this platform, e.g.
+// "gssapi (libgssapi_krb5.so.2)", "gokrb5 (pure-Go)", or "sspi (Kerberos)".
+// Useful for verbose diagnostics.
+func Backend() string { return negotiate.Backend() }
+
 // Options holds the configuration for a krbhttp client.
 // Use NewOptions to create an instance, configure it with builder methods,
 // and call NewClient when ready. All builder methods return *Options to allow

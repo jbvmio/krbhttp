@@ -101,13 +101,15 @@ c, err := krbhttp.NewOptions().
 
 ## Platform support
 
-All three platforms are CGo-free:
+All three platforms are CGo-free (purego `dlopen`s system libraries at runtime; no C toolchain is needed to build):
 
-| Platform | Mechanism | Notes |
+| Platform | Backend | Notes |
 |---|---|---|
-| **macOS** | `GSS.framework` via [ebitengine/purego](https://github.com/ebitengine/purego) | Apple's Heimdal GSSAPI; reads both FILE and API-type (CCAPI) ccaches — corporate SSO credentials are picked up automatically |
-| **Linux** | [jcmturner/gokrb5](https://github.com/jcmturner/gokrb5) (pure Go) | Reads `KRB5CCNAME` or `/tmp/krb5cc_$(id -u)`; passes an explicit SPN to avoid gokrb5's internal `net.LookupCNAME` call (see [jcmturner/gokrb5#527](https://github.com/jcmturner/gokrb5/issues/527)) |
-| **Windows** | `secur32.dll` / SSPI | Loaded at runtime via `golang.org/x/sys/windows`; SSPI handles credential lookup and CNAME resolution internally |
+| **macOS** | `GSS.framework` via [ebitengine/purego](https://github.com/ebitengine/purego) | Apple's Heimdal GSSAPI; reads both FILE and API-type (CCAPI) ccaches. The framework canonicalizes the SPN itself (curl parity). |
+| **Linux** | system `libgssapi` (preferred) → [jcmturner/gokrb5](https://github.com/jcmturner/gokrb5) (pure-Go fallback) | Prefers `libgssapi_krb5.so.2` / `libgssapi.so.3` for curl-parity canonicalization; falls back to pure-Go gokrb5 when no system library is present (e.g. distroless images). `WithCCachePath`/`WithConfPath` map to `KRB5CCNAME`/`KRB5_CONFIG` on the libgssapi path. |
+| **Windows** | `secur32.dll` / SSPI **Kerberos** package | Uses the `Kerberos` SSP (not `Negotiate`) to avoid a silent NTLM downgrade; client-side DNS resolution supplies canonicalization. |
+
+Call `krbhttp.Backend()` to see which path is live, e.g. `gssapi (libgssapi_krb5.so.2)`, `gokrb5 (pure-Go)`, or `sspi (Kerberos)`.
 
 ---
 
@@ -123,18 +125,15 @@ The transport adds a fresh, host-specific Kerberos token to _every_ outgoing req
 
 This mirrors the behavior of `curl --negotiate --location-trusted`.
 
-### SPN canonicalization (literal-first with fallback)
+### SPN canonicalization
 
-The Kerberos SPN a client presents is `HTTP/<host>`. Which `<host>` is correct depends on the environment, and the two common topologies pull in opposite directions:
+The SPN presented is `HTTP/<host>`, and the correct `<host>` depends on the environment: some services register the SPN under the canonical A-record (the CNAME alias must be resolved), others under the alias itself (resolving breaks it). `krbhttp` defaults to **literal-first with fallback** — the `dns_canonicalize_hostname = fallback` strategy curl and MIT krb5 use: try the URL host as-is, and only retry with the DNS-resolved name if the KDC rejects it as an unknown SPN. Where a system krb5/GSSAPI library handles the request (macOS, Linux `libgssapi`) it does this itself; otherwise `krbhttp` does it. See the `Canonicalization` docs in [negotiate/token.go](negotiate/token.go) for the details.
 
-- **Canonical-A-record registered** (single host behind a CNAME alias): the SPN is registered under the final A-record, so the alias must be **resolved**. Passing the alias verbatim gets `KDC_ERR_S_PRINCIPAL_UNKNOWN` / `GSS_S_BAD_MECH`. This is the [gokrb5 #527](https://github.com/jcmturner/gokrb5/issues/527) case.
-- **Alias registered** (service alias in front of a load balancer / GSLB VIP): the SPN is registered under the **alias**, and resolving collapses it to a shared VIP that has no SPN — again a rejection.
+Override per client with [`WithSPNCanonicalization`](#all-options): `CanonicalizeFallback` (default), `CanonicalizeNever` (literal only), or `CanonicalizeAlways` (resolve first).
 
-No single unconditional strategy satisfies both. `krbhttp` therefore uses **literal-first with fallback**, mirroring MIT krb5's `dns_canonicalize_hostname = fallback` (and how curl behaves): it builds the SPN from the URL host verbatim first, and only if the KDC/mechanism rejects it as an unknown SPN does it retry with the CNAME-resolved canonical name. When resolution is needed, `krbhttp` iterates `net.LookupCNAME` until the result stabilises — a single call is not sufficient because both the CGo and pure-Go resolvers can stop at intermediate hops for multi-level CNAME chains ([golang/go#59943](https://github.com/golang/go/issues/59943)).
+> **Windows is Kerberos-only.** To stop the SSPI `Negotiate` package from silently downgrading to NTLM (which hides the unknown-SPN signal and leaks an NTLM blob to OIDC endpoints that reject it), the Windows backend uses the `Kerberos` SSP and rejects any NTLM token. If you previously relied on NTLM fallback on Windows, this is a behavior change.
 
-In practice, Windows/SSPI and macOS/`GSS.framework` usually resolve or accept the literal SPN themselves, so the application-level fallback rarely fires there; it does the real work on Linux, where gokrb5 has no internal canonicalization or fallback of its own.
-
-Override the strategy per client with [`WithSPNCanonicalization`](#all-options): `CanonicalizeFallback` (default), `CanonicalizeNever` (literal only), or `CanonicalizeAlways` (resolve first, legacy behaviour).
+> **Linux runtime dependency.** The preferred Linux backend `dlopen`s a system `libgssapi` at runtime. The binary stays statically linkable / CGo-free; if no library is found, `krbhttp` transparently falls back to the pure-Go gokrb5 implementation, so minimal/distroless images keep working.
 
 ---
 

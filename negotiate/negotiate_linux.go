@@ -25,9 +25,9 @@ package negotiate
 // variable and default path logic from sampleKrb5App is used.
 
 import (
-	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -41,6 +41,14 @@ import (
 	"github.com/jbvmio/krbhttp/krb"
 )
 
+// linuxGSSAPIPaths is the dlopen search order: MIT first, then Heimdal.
+var linuxGSSAPIPaths = []string{
+	"libgssapi_krb5.so.2", "libgssapi_krb5.so", // MIT
+	"libgssapi.so.3", "libgssapi.so", // Heimdal
+}
+
+func init() { loadGSSAPI(linuxGSSAPIPaths) } // best-effort; gokrb5 is the fallback
+
 var (
 	mu         sync.RWMutex
 	ccachePath string // set by SetCCachePath; empty = use defaults
@@ -49,32 +57,60 @@ var (
 
 // SetCCachePath overrides the ccache file path used on Linux.
 // The default resolution order is: KRB5CCNAME env var → /tmp/krb5cc_<uid>.
+// The pure-Go gokrb5 path reads this path directly; the libgssapi path honors
+// it via the KRB5CCNAME environment variable, which this function also sets.
 // This function is called by client.NewClient when WithCCachePath is used.
 // It is safe to call from multiple goroutines.
 func SetCCachePath(path string) {
 	mu.Lock()
 	ccachePath = path
 	mu.Unlock()
+	if path != "" {
+		_ = os.Setenv("KRB5CCNAME", path) // the libgssapi path reads the ccache via env
+	}
 }
 
 // SetConfPath overrides the krb5.conf file path used on Linux.
 // The default resolution order is: KRB5_CONFIG env var → ~/.krb5.conf → /etc/krb5.conf.
+// The pure-Go gokrb5 path reads this path directly; the libgssapi path honors
+// it via the KRB5_CONFIG environment variable, which this function also sets.
 // It is safe to call from multiple goroutines.
 func SetConfPath(path string) {
 	mu.Lock()
 	confPath = path
 	mu.Unlock()
+	if path != "" {
+		_ = os.Setenv("KRB5_CONFIG", path) // the libgssapi path reads krb5.conf via env
+	}
 }
 
-// tokenForHost generates a raw SPNEGO/Kerberos token for the SPN HTTP/hostname
-// built from hostname verbatim (no DNS canonicalization).
+// tokenForHost prefers the system GSSAPI library (curl parity: it canonicalizes
+// the hostbased SPN itself), falling back to the pure-Go gokrb5 path when no
+// libgssapi is present.
+func tokenForHost(hostname string) ([]byte, error) {
+	if gssapiLoaded {
+		return gssapiTokenForHost(hostname)
+	}
+	return tokenForHostGokrb5(hostname)
+}
+
+// Backend reports the active token backend for diagnostics.
+func Backend() string {
+	if gssapiLoaded {
+		return "gssapi (" + gssapiLibPath + ")"
+	}
+	return "gokrb5 (pure-Go)"
+}
+
+// tokenForHostGokrb5 generates a raw SPNEGO/Kerberos token for the SPN
+// HTTP/hostname built from hostname verbatim (no DNS canonicalization).
 //
 // The SPN is constructed as "HTTP/hostname" and passed explicitly to gokrb5,
 // bypassing the broken net.LookupCNAME path entirely.
 //
 // The ccache and krb5.conf paths are resolved at call time so that calls to
 // SetCCachePath / SetConfPath take effect without restarting.
-func tokenForHost(hostname string) ([]byte, error) {
+func tokenForHostGokrb5(hostname string) ([]byte, error) {
 	mu.RLock()
 	cc := ccachePath
 	cf := confPath
@@ -134,30 +170,32 @@ func tokenForHost(hostname string) ([]byte, error) {
 		return nil, fmt.Errorf("negotiate: marshalling SPNEGO token: %w", err)
 	}
 
-	// Sanity check: the token should not be empty base64. The spnego package
-	// returns the raw bytes (not base64), so we just do a quick decode-round-trip
-	// to confirm the bytes are valid before returning them.
 	if len(tokenBytes) == 0 {
 		return nil, fmt.Errorf("negotiate: marshalled SPNEGO token is empty")
 	}
-
-	// Verify the bytes decode cleanly when base64-encoded, to catch any silent
-	// marshalling oddities early. The actual base64 encoding is left to the caller.
-	encoded := base64.StdEncoding.EncodeToString(tokenBytes)
-	if strings.TrimSpace(encoded) == "" {
-		return nil, fmt.Errorf("negotiate: SPNEGO token base64 is empty after encoding")
-	}
-
 	return tokenBytes, nil
 }
 
-// classifyKRBError flags KDC_ERR_S_PRINCIPAL_UNKNOWN (the gokrb5 equivalent of
+// classifyKRBError flags the unknown-SPN KDC codes (the gokrb5 equivalent of
 // GSS_S_BAD_MECH) as unsupportedMech so Token can fall back to the canonical
-// hostname. All other errors are returned unchanged.
+// hostname. gokrb5 wraps KDC errors in *krberror.Krberror, which does NOT
+// Unwrap to messages.KRBError, so the text is matched directly as well.
 func classifyKRBError(err error) error {
 	var krbErr messages.KRBError
-	if errors.As(err, &krbErr) && krbErr.ErrorCode == errorcode.KDC_ERR_S_PRINCIPAL_UNKNOWN {
+	if errors.As(err, &krbErr) && isUnknownSPNCode(krbErr.ErrorCode) {
+		return &NegotiateError{msg: err.Error(), unsupportedMech: true}
+	}
+	up := strings.ToUpper(err.Error())
+	if strings.Contains(up, "KDC_ERR_S_PRINCIPAL_UNKNOWN") ||
+		strings.Contains(up, "KDC_ERR_PRINCIPAL_NOT_UNIQUE") ||
+		strings.Contains(up, "KDC_ERR_SVC_UNAVAILABLE") {
 		return &NegotiateError{msg: err.Error(), unsupportedMech: true}
 	}
 	return err
+}
+
+func isUnknownSPNCode(c int32) bool {
+	return c == errorcode.KDC_ERR_S_PRINCIPAL_UNKNOWN ||
+		c == errorcode.KDC_ERR_PRINCIPAL_NOT_UNIQUE ||
+		c == errorcode.KDC_ERR_SVC_UNAVAILABLE
 }
